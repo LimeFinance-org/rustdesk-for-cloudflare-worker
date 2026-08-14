@@ -11,6 +11,11 @@ type Bindings = {
 
 const app = new Hono<{ Bindings: Bindings }>()
 
+const REPO_URL = 'https://github.com/LimeFinance-org/rustdesk-for-cloudflare-worker'
+
+// Humans hitting the domain get redirected to the project page.
+app.get('/', (c) => c.redirect(REPO_URL, 302))
+
 app.get('/ws/id', async (c) => {
   const hbbsId = c.env.HBBS.idFromName('hbbs')
   const hbbsObj = c.env.HBBS.get(hbbsId)
@@ -31,5 +36,8 @@ app.all('/api/*', async (c) => {
   // TODO: implement some apis
   return c.json({}, 404)
 })
+
+// Any other unmatched path also goes to the project page.
+app.notFound((c) => c.redirect(REPO_URL, 302))
 
 export default app
