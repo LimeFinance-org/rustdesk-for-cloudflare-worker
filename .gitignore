@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# User-local configuration (contains your domain and relay key) — never commit
+config.json
+wrangler.local.json
+
+# Wrangler local artifacts
+.wrangler/
+.dev.vars
+
+# Editor
+.vscode/
+.idea/
+
+# Logs
+*.log
