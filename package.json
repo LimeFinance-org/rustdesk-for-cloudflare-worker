@@ -1,6 +1,7 @@
 {
 	"name": "hbbs-worker",
 	"private": true,
+	"type": "module",
 	"cloudflare": {
 		"label": "Durable Objects worker for HBBS"
 	},
@@ -9,14 +10,20 @@
 		"hono": "^4.10.4"
 	},
 	"devDependencies": {
+		"@cloudflare/vitest-plugin": "^1.1.2",
+		"@types/node": "^26.4.0",
 		"typescript": "5.8.3",
-		"wrangler": "4.45.3"
+		"vitest": "^4.1.11",
+		"wrangler": "^4.127.1"
 	},
 	"scripts": {
 		"cf-typegen": "wrangler types",
 		"check": "tsc && wrangler deploy --dry-run",
+		"test": "vitest run",
+		"test:watch": "vitest",
 		"setup": "node scripts/setup.mjs",
-		"deploy": "node scripts/setup.mjs && wrangler deploy -c wrangler.local.json",
+		"deploy": "wrangler deploy -c wrangler.local.json",
+		"deploy:setup": "node scripts/setup.mjs && wrangler deploy -c wrangler.local.json",
 		"tail": "wrangler tail -c wrangler.local.json",
 		"dev": "wrangler dev",
 		"start": "wrangler dev"

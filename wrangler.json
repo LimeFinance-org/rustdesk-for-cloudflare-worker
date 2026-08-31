@@ -2,9 +2,13 @@
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "rustdesk-for-cloudflare-worker",
 	"main": "src/index.ts",
-	"compatibility_date": "2025-10-08",
+	"compatibility_date": "2026-08-31",
+	"compatibility_flags": ["nodejs_compat"],
+	"vars": {
+		"DO_LOCATION_HINT": "apac"
+	},
 	"routes": [
-		{ "pattern": "rust.example.com", "custom_domain": true }
+		{ "pattern": "rust.limefinance.org", "custom_domain": true }
 	],
 	"upload_source_maps": true,
 	"migrations": [
@@ -29,7 +33,15 @@
 		]
 	},
 	"observability": {
-		"enabled": true
+		"enabled": true,
+		"logs": {
+			"enabled": true,
+			"head_sampling_rate": 1
+		},
+		"traces": {
+			"enabled": true,
+			"head_sampling_rate": 0.01
+		}
 	},
 	"dev": {
 		"port": 80

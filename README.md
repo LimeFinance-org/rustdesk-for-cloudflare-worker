@@ -27,18 +27,23 @@ Prerequisites: a free [Cloudflare account](https://dash.cloudflare.com/sign-up) 
 ```bash
 npm install
 npx wrangler login          # click Allow in the browser
-npm run setup               # generates config.json — edit your domain & key in it
-npm run deploy              # uploads the key as a Cloudflare secret and deploys
+npm run setup               # first run creates config.json and exits
+# edit config.json with your domain, key, and optional locationHint
+npm run setup               # run again to generate deployment config and upload secrets
+npm run deploy              # deploys the generated config without re-uploading secrets
 ```
 
 The generated `config.json` (gitignored, never committed):
 
 ```json
 {
-	"domain": "rust.example.com",       // ← your domain (hosted in your Cloudflare account)
-	"key": "a-random-string-20+chars"   // ← also goes into the Key field of every RustDesk client
+	"domain": "rust.example.com",
+	"key": "a-random-string-20+chars",
+	"locationHint": "apac"
 }
 ```
+
+`locationHint` defaults to `apac` for China/APAC users. `apac-ne` and `apac-se` are also available. This is a best-effort Durable Object placement hint, not a country-specific IP, and an existing Durable Object will not move automatically after changing it.
 
 Verify (replace the domain; a `101` response means it works):
 
@@ -60,10 +65,27 @@ RustDesk → Settings → Network → unlock advanced settings:
 
 The controlled side shows **"Ready"** when registered. Server logs: `npm run tail`.
 
+## Multiple sessions and performance
+
+- Every remote connection gets its own HBBR Durable Object. Relay frame buffers are not shared between sessions, so a slow session cannot mix with or directly block another session.
+- The single named HBBS Durable Object handles signaling, online checks, and relay setup only. Remote data frames are forwarded by the per-session HBBR objects, so multiple remote sessions can run concurrently.
+- `MAX_SESSIONS` limits online device IDs, not active remote sessions. Each HBBR session accepts exactly two WebSockets, one from each endpoint.
+- The default per-relay send-buffer limit is 2 MiB, balancing interactive latency with memory use across concurrent sessions. Increasing it without measuring can make concurrency worse.
+
+If many clients connect at the same time, tune these optional settings after testing (they are regular string settings and can also be set in the Cloudflare Dashboard under Variables):
+
+```bash
+# Consider 4194304 for large-screen/file-transfer throughput; keep 2097152 for interactive use
+npx wrangler secret put MAX_RELAY_BUFFERED_BYTES -c wrangler.local.json
+
+# Only limits sockets that have not completed registration; it does not limit active relays
+npx wrangler secret put MAX_PENDING_CONNECTIONS -c wrangler.local.json
+```
+
 ## Security
 
-- All traffic runs over wss (TLS); session content stays end-to-end encrypted by RustDesk
-- Relay requests must present the `key`; mismatches are rejected
+- All traffic runs over wss (TLS); the Worker only forwards WebSocket frames
+- Relay requests must present the `key`; this project key is a Relay admission secret, not the native hbbs server public key
 - Max 100 online IDs by default (anti-abuse); adjust with `npx wrangler secret put MAX_SESSIONS`
 - Also set a strong password or 2FA on the controlled device
 
@@ -73,7 +95,7 @@ The controlled side shows **"Ready"** when registered. Server logs: `npm run tai
 |---|---|
 | Client never shows "Ready" | API Server must start with `https://`; check the client log shows `wss://` |
 | Online but disconnects on connect | Both sides' Key must match the `key` in `config.json`; check `npm run tail` for `relay auth failed` |
-| Cannot connect from Mainland China | Bind your own domain (`workers.dev` is blocked); note Cloudflare has no free-tier PoPs in Mainland China, so 150–300 ms+ latency is expected |
+| Cannot connect from Mainland China | Bind your own domain (`workers.dev` is blocked); normal Workers cannot guarantee a Mainland China PoP or fixed China IP, so keep `locationHint: "apac"` and benchmark your ISP path |
 | Everything suddenly fails | Free quota exhausted; resets daily at 00:00 UTC |
 
 ## License

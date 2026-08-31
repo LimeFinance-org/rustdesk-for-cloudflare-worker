@@ -15,3 +15,6 @@ wrangler.local.json
 
 # Logs
 *.log
+
+# Test output
+coverage/
