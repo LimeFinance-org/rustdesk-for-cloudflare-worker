@@ -23,6 +23,7 @@ type RelayMessage = string | ArrayBuffer
 
 type RendezvousPayload =
 	| { registerPkResponse: rendezvous.RegisterPkResponse }
+	| { registerPeerResponse: rendezvous.RegisterPeerResponse }
 	| { punchHoleResponse: rendezvous.PunchHoleResponse }
 	| { requestRelay: rendezvous.RequestRelay }
 	| { relayResponse: rendezvous.RelayResponse }
@@ -73,6 +74,15 @@ const DEFAULT_RELAY_BUFFERED_BYTES = 2 * 1024 * 1024
 const DEFAULT_RELAY_HANDSHAKE_TIMEOUT_MS = 30_000
 const DEFAULT_MAX_PENDING_CONNECTIONS = 256
 const PENDING_CONNECTION_TIMEOUT_MS = 30_000
+// RustDesk clients drop the rendezvous connection and reconnect once nothing
+// has been received for keep_alive * 1.5 seconds. Without a server heartbeat an
+// idle device therefore flaps offline every few minutes. Advertise a keep-alive
+// and send an empty binary frame (the client's heartbeat format) well inside
+// that window. The short interval also keeps idle WebSockets from being reaped
+// by intermediaries and lets clients notice dead connections within ~2 minutes.
+const HBBS_KEEP_ALIVE_SECONDS = 90
+const HBBS_HEARTBEAT_INTERVAL_MS = 30_000
+const HEARTBEAT_FRAME = new ArrayBuffer(0)
 const ORIGIN_STORAGE_KEY = 'hbbs.origin'
 
 function logEvent(message: string, fields: Record<string, string | number | boolean> = {}): void {
@@ -547,6 +557,9 @@ export class Hbbr extends DurableObject<WorkerEnv> {
 export class Hbbs extends DurableObject<WorkerEnv> {
 	private sessions = new Map<string, HbbsSession>()
 	private origin = ''
+	// Kept in memory only; after hibernation it is re-derived from the stored
+	// alarm so frequent wake-ups cannot keep postponing the heartbeat.
+	private nextHeartbeatAt = 0
 
 	constructor(ctx: DurableObjectState, env: WorkerEnv) {
 		super(ctx, env)
@@ -614,8 +627,8 @@ export class Hbbs extends DurableObject<WorkerEnv> {
 			kind: 'pending',
 			connectedAt: Date.now(),
 		} satisfies PendingSocketAttachment)
-		this.ctx.waitUntil(this.reconcilePendingAlarm().catch((error) => {
-			logEvent('failed to schedule pending connection cleanup', {
+		this.ctx.waitUntil(this.reconcileAlarm().catch((error) => {
+			logEvent('failed to schedule rendezvous alarm', {
 				error: error instanceof Error ? error.message : String(error),
 			})
 		}))
@@ -635,6 +648,10 @@ export class Hbbs extends DurableObject<WorkerEnv> {
 			closeSocket(ws, 1009, 'rendezvous message is too large')
 			return
 		}
+		// Empty frames are heartbeats (or the client's echo of ours).
+		if (message.byteLength === 0) {
+			return
+		}
 
 		let msg: rendezvous.RendezvousMessage
 		try {
@@ -649,7 +666,13 @@ export class Hbbs extends DurableObject<WorkerEnv> {
 
 		switch (msg.union?.oneofKind) {
 			case 'registerPk':
-				this.handleRegisterPk(msg.union.registerPk, ws)
+				if (this.handleRegisterPk(msg.union.registerPk, ws)) {
+					// The socket is now a session and needs heartbeats.
+					await this.reconcileAlarm()
+				}
+				break
+			case 'registerPeer':
+				this.handleRegisterPeer(msg.union.registerPeer, ws)
 				break
 			case 'onlineRequest':
 				this.handleOnlineRequest(msg.union.onlineRequest, ws)
@@ -661,7 +684,13 @@ export class Hbbs extends DurableObject<WorkerEnv> {
 				this.handleRelayResponse(msg.union.relayResponse, ws)
 				break
 			default:
-				closeSocket(ws, 1003, 'unsupported rendezvous message')
+				// Clients also send messages this worker does not implement
+				// (HealthCheck, TestNatRequest, SoftwareUpdate, ...). Closing the
+				// socket for those turns into a reconnect loop on the client, which
+				// is what the original hbbs avoids by ignoring them as well.
+				logEvent('ignored rendezvous message', {
+					type: msg.union?.oneofKind ?? 'empty',
+				})
 		}
 	}
 
@@ -680,7 +709,7 @@ export class Hbbs extends DurableObject<WorkerEnv> {
 			}
 		}
 
-		await this.reconcilePendingAlarm()
+		await this.reconcileAlarm()
 	}
 
 	async webSocketError(ws: WebSocket, error: unknown): Promise<void> {
@@ -688,7 +717,7 @@ export class Hbbs extends DurableObject<WorkerEnv> {
 			error: error instanceof Error ? error.message : String(error),
 		})
 		closeSocket(ws, 1011, 'rendezvous socket error')
-		await this.reconcilePendingAlarm()
+		await this.reconcileAlarm()
 	}
 
 	async alarm(): Promise<void> {
@@ -703,7 +732,14 @@ export class Hbbs extends DurableObject<WorkerEnv> {
 				closeSocket(socket, 4004, 'registration timeout')
 			}
 		}
-		await this.reconcilePendingAlarm()
+
+		// nextHeartbeatAt is 0 after hibernation; the alarm only fires when
+		// something is due, so sending a slightly early heartbeat is harmless.
+		if (now >= this.nextHeartbeatAt) {
+			this.sendHeartbeats()
+			this.nextHeartbeatAt = now + HBBS_HEARTBEAT_INTERVAL_MS
+		}
+		await this.reconcileAlarm()
 	}
 
 	sendRendezvous(data: RendezvousPayload, socket: WebSocket | undefined): boolean {
@@ -735,20 +771,24 @@ export class Hbbs extends DurableObject<WorkerEnv> {
 		}
 	}
 
-	handleRelayResponse(res: rendezvous.RelayResponse, socket: WebSocket): void {
-		if (!this.getSessionForSocket(socket)) {
-			closeSocket(socket, 4004, 'register first')
-			return
-		}
+	// RustDesk clients send RelayResponse, PunchHoleRequest and OnlineRequest on
+	// short-lived connections of their own, never on the registered long-lived
+	// one, so none of these handlers may require a registered socket.
+	handleRelayResponse(res: rendezvous.RelayResponse, _socket: WebSocket): void {
 		logEvent('relay response received', { version: res.version })
+	}
+
+	handleRegisterPeer(req: rendezvous.RegisterPeer, socket: WebSocket): void {
+		const session = this.getSessionForSocket(socket, req.id.trim())
+		this.sendRendezvous({
+			registerPeerResponse: rendezvous.RegisterPeerResponse.create({
+				requestPk: !session?.pk,
+			}),
+		}, socket)
 	}
 
 	async handlePunchHoleRequest(req: rendezvous.PunchHoleRequest, socket: WebSocket): Promise<void> {
 		const requester = this.getSessionForSocket(socket)
-		if (!requester) {
-			closeSocket(socket, 4004, 'register first')
-			return
-		}
 
 		const relayKey = this.env.RELAY_KEY?.trim()
 		if (!relayKey || !(await timingSafeSecretEqual(req.licenceKey, relayKey))) {
@@ -762,7 +802,7 @@ export class Hbbs extends DurableObject<WorkerEnv> {
 		}
 
 		const targetId = req.id.trim()
-		if (!isValidPeerId(targetId) || targetId === requester.id) {
+		if (!isValidPeerId(targetId) || targetId === requester?.id) {
 			this.sendPunchFailure(socket, 'invalid target', rendezvous.PunchHoleResponse_Failure.ID_NOT_EXIST)
 			return
 		}
@@ -821,21 +861,22 @@ export class Hbbs extends DurableObject<WorkerEnv> {
 		}, socket)
 	}
 
-	handleRegisterPk(req: rendezvous.RegisterPk, socket: WebSocket): void {
+	/** Returns true when the socket ended up registered. */
+	handleRegisterPk(req: rendezvous.RegisterPk, socket: WebSocket): boolean {
 		const peerId = req.id.trim()
 		const peerUuid = new TextDecoder().decode(req.uuid)
 		const peerPk = bytesToBase64(req.pk)
 		if (!isValidPeerId(peerId)) {
 			this.sendRegisterResponse(socket, rendezvous.RegisterPkResponse_Result.INVALID_ID_FORMAT)
 			closeSocket(socket, 4004, 'invalid peer id')
-			return
+			return false
 		}
 
 		const currentForId = this.sessions.get(peerId)
 		if (currentForId && !identityMatches(currentForId, peerUuid)) {
 			this.sendRegisterResponse(socket, rendezvous.RegisterPkResponse_Result.UUID_MISMATCH)
 			closeSocket(socket, 4004, 'peer identity mismatch')
-			return
+			return false
 		}
 
 		const maxSessions = readPositiveInteger(
@@ -848,7 +889,7 @@ export class Hbbs extends DurableObject<WorkerEnv> {
 			logEvent('registration rejected because session table is full', { maxSessions })
 			this.sendRegisterResponse(socket, rendezvous.RegisterPkResponse_Result.SERVER_ERROR)
 			closeSocket(socket, 4003, 'server full')
-			return
+			return false
 		}
 
 		if (currentForId && currentForId.socket !== socket) {
@@ -883,16 +924,12 @@ export class Hbbs extends DurableObject<WorkerEnv> {
 				this.sessions.delete(peerId)
 			}
 			closeSocket(socket, 1011, 'registration response failed')
+			return false
 		}
+		return true
 	}
 
 	handleOnlineRequest(req: rendezvous.OnlineRequest, socket: WebSocket): void {
-		const requesterId = req.id.trim()
-		if (!this.getSessionForSocket(socket, requesterId)) {
-			closeSocket(socket, 4004, 'register first')
-			return
-		}
-
 		const peers = req.peers.slice(0, MAX_ONLINE_QUERY_PEERS)
 		const states = packOnlineStates(
 			peers,
@@ -913,7 +950,7 @@ export class Hbbs extends DurableObject<WorkerEnv> {
 		return this.sendRendezvous({
 			registerPkResponse: rendezvous.RegisterPkResponse.create({
 				result,
-				keepAlive: 180,
+				keepAlive: HBBS_KEEP_ALIVE_SECONDS,
 			}),
 		}, socket)
 	}
@@ -962,23 +999,64 @@ export class Hbbs extends DurableObject<WorkerEnv> {
 		)
 	}
 
-	private async reconcilePendingAlarm(): Promise<void> {
-		let earliestDeadline: number | undefined
+	private sendHeartbeats(): void {
+		for (const session of this.sessions.values()) {
+			if (!isOpen(session.socket)) {
+				continue
+			}
+			try {
+				session.socket.send(HEARTBEAT_FRAME)
+			} catch {
+				closeSocket(session.socket, 1011, 'heartbeat failed')
+			}
+		}
+	}
+
+	private hasOpenSessions(): boolean {
+		for (const session of this.sessions.values()) {
+			if (isOpen(session.socket)) {
+				return true
+			}
+		}
+		return false
+	}
+
+	/**
+	 * One alarm drives both pending-registration timeouts and heartbeats; it
+	 * is set to whichever is due first, or cleared when nothing is connected.
+	 */
+	private async reconcileAlarm(): Promise<void> {
+		let next: number | undefined
 		for (const socket of this.ctx.getWebSockets()) {
 			const meta = readHbbsAttachment(socket)
 			if (socket.readyState >= 2 || meta?.kind !== 'pending') {
 				continue
 			}
 			const deadline = meta.connectedAt + PENDING_CONNECTION_TIMEOUT_MS
-			if (earliestDeadline === undefined || deadline < earliestDeadline) {
-				earliestDeadline = deadline
+			if (next === undefined || deadline < next) {
+				next = deadline
 			}
 		}
 
-		if (earliestDeadline === undefined) {
+		if (this.hasOpenSessions()) {
+			if (this.nextHeartbeatAt === 0) {
+				const now = Date.now()
+				const stored = await this.ctx.storage.getAlarm()
+				this.nextHeartbeatAt = stored !== null && stored > now
+					? Math.min(stored, now + HBBS_HEARTBEAT_INTERVAL_MS)
+					: now + HBBS_HEARTBEAT_INTERVAL_MS
+			}
+			if (next === undefined || this.nextHeartbeatAt < next) {
+				next = this.nextHeartbeatAt
+			}
+		} else {
+			this.nextHeartbeatAt = 0
+		}
+
+		if (next === undefined) {
 			await this.ctx.storage.deleteAlarm()
 		} else {
-			await this.ctx.storage.setAlarm(earliestDeadline)
+			await this.ctx.storage.setAlarm(next)
 		}
 	}
 }

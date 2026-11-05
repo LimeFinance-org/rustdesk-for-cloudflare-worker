@@ -5,6 +5,11 @@ export default defineConfig({
 	plugins: [
 		cloudflareTest({
 			wrangler: { configPath: './wrangler.json' },
+			miniflare: {
+				bindings: {
+					RELAY_KEY: 'test-relay-key',
+				},
+			},
 		}),
 	],
 })
